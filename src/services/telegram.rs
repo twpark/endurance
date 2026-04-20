@@ -7045,6 +7045,7 @@ async fn handle_text_message(
         let mut pending_cokacdir = false;
         let mut suppress_tool_display = false;
         let mut last_tool_name: String = String::new();
+        let mut last_tool_start: Option<std::time::Instant> = None;
         let mut placeholder_msg_id = placeholder_msg_id;
         let mut last_confirmed_len: usize = 0;
 
@@ -7096,6 +7097,7 @@ async fn handle_text_message(
                                     pending_cokacdir = detect_cokacdir_command(&name, &input);
                                     suppress_tool_display = detect_chat_log_read(&name, &input);
                                     last_tool_name = name.clone();
+                                    last_tool_start = Some(std::time::Instant::now());
                                     let summary = format_tool_input(&name, &input);
                                     let ts = chrono::Local::now().format("%H:%M:%S");
                                     println!("  [{ts}]   ⚙ {name}: {summary}");
@@ -7123,6 +7125,7 @@ async fn handle_text_message(
                                     }
                                 }
                                 StreamMessage::ToolResult { content, is_error } => {
+                                    last_tool_start = None;
                                     msg_debug(&format!("[polling] ToolResult: is_error={}, content_len={}, pending_cokacdir={}, last_tool={}", is_error, content.len(), pending_cokacdir, last_tool_name));
                                     if is_error {
                                         msg_debug(&format!("[polling] ToolResult ERROR: last_tool={}, content_preview={:?}", last_tool_name, truncate_str(&content, 300)));
@@ -7289,10 +7292,19 @@ async fn handle_text_message(
                             spin_idx = 0;
                         }
                     } else {
-                        // No new content — spinner update on current placeholder
-                        let indicator = SPINNER[spin_idx % SPINNER.len()];
-                        spin_idx += 1;
-                        let display_text = indicator.to_string();
+                        // No new content — show tool status with elapsed time, or spinner
+                        let display_text = if !last_tool_name.is_empty() {
+                            if let Some(start) = last_tool_start {
+                                let elapsed = start.elapsed().as_secs();
+                                format!("⚙️ {}... {}s", last_tool_name, elapsed)
+                            } else {
+                                format!("⚙️ {}...", last_tool_name)
+                            }
+                        } else {
+                            let indicator = SPINNER[spin_idx % SPINNER.len()];
+                            spin_idx += 1;
+                            indicator.to_string()
+                        };
                         if display_text != last_edit_text {
                             shared_rate_limit_wait(&state_owned, chat_id).await;
                             let html_text = markdown_to_telegram_html(&display_text);
