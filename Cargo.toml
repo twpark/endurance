@@ -1,12 +1,11 @@
 [package]
-name = "cokacdir"
-version = "0.4.96"
+name = "endurance"
+version = "0.5.0"
 edition = "2021"
-authors = ["cokac <monogatree@gmail.com>"]
-description = "Telegram/Discord bot that runs Claude Code, Codex, Gemini, and Opencode, with a multi-panel terminal file manager"
+authors = ["Teddy Park <taiwoo.park@gmail.com>", "cokac <monogatree@gmail.com>"]
+description = "Agentic bot platform — Telegram bots with Claude/Gemini, structured message storage, and HTTP API"
 license = "MIT"
-repository = "https://github.com/kstost/cokacdir"
-homepage = "https://cokacdir.cokac.com"
+repository = "https://github.com/twpark/endurance"
 keywords = ["terminal", "cli", "file-manager", "multi-panel", "tui", "ai"]
 categories = ["command-line-utilities", "filesystem"]
 
@@ -45,6 +44,13 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 fs2 = "0.4"
 filetime = "0.2"
 rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Endurance additions
+axum = "0.7"
+tower-http = { version = "0.6", features = ["cors"] }
+grammers-client = "0.9"
+grammers-session = "0.9"
+grammers-tl-types = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
