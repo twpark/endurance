@@ -11,3 +11,4 @@ pub mod remote_transfer;
 pub mod dedup;
 pub mod session_archive;
 pub mod telegram;
+pub mod storage;
