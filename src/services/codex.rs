@@ -509,6 +509,7 @@ pub fn execute_command_streaming(
                         codex_debug_log(&format!("  >>> Init: session_id={}", session_id));
                         last_session_id = Some(session_id.clone());
                     }
+                    StreamMessage::Thinking { .. } => {}
                     StreamMessage::Done { .. } => {
                         codex_debug_log("  >>> Done");
                         got_done = true;

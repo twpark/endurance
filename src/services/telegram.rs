@@ -7082,6 +7082,10 @@ async fn handle_text_message(
                                     ai_trace(&format!("[STREAM] Init: session_id={}", sid));
                                     new_session_id = Some(sid);
                                 }
+                                StreamMessage::Thinking { content } => {
+                                    // Capture thinking but don't send to Telegram
+                                    msg_debug(&format!("[polling] Thinking: {} chars", content.len()));
+                                }
                                 StreamMessage::Text { content } => {
                                     msg_debug(&format!("[polling] Text: {} chars, preview={:?}",
                                         content.len(), truncate_str(&content, 80)));
@@ -9299,6 +9303,9 @@ async fn execute_schedule(
                             StreamMessage::Init { session_id } => {
                                 exec_session_id = Some(session_id);
                             }
+                            StreamMessage::Thinking { .. } => {
+                                // Captured in DB later; skip for Telegram output
+                            }
                             StreamMessage::Text { content } => {
                                 sched_debug(&format!("[sched] Text: {} chars, preview={:?}",
                                     content.len(), truncate_str(&content, 80)));
@@ -10093,6 +10100,9 @@ async fn process_bot_message(
                                 StreamMessage::Init { session_id: sid } => {
                                     msg_debug(&format!("[botmsg_poll:{}] Init: session_id={}", bmsg_id_for_log, sid));
                                     new_session_id = Some(sid);
+                                }
+                                StreamMessage::Thinking { content } => {
+                                    msg_debug(&format!("[botmsg_poll:{}] Thinking: {} chars", bmsg_id_for_log, content.len()));
                                 }
                                 StreamMessage::Text { content } => {
                                     msg_debug(&format!("[botmsg_poll:{}] Text: chunk_len={}, total_len={}",

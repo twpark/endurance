@@ -964,6 +964,9 @@ Keep responses concise and terminal-friendly.",
                 StreamMessage::Init { session_id } => {
                     self.session_id = Some(session_id.clone());
                 }
+                StreamMessage::Thinking { .. } => {
+                    // Thinking captured in storage layer
+                }
                 StreamMessage::Text { content } => {
                     // Replace streaming buffer with new text (stream-json sends full text, not deltas)
                     self.streaming_buffer = content;

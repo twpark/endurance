@@ -996,6 +996,9 @@ fn test_opencode_sse(prompt: &str, extra: &[String]) -> i32 {
                         s.last_session_id = Some(session_id.clone());
                         println!("[TEST] Init session_id={}", session_id);
                     }
+                    StreamMessage::Thinking { content } => {
+                        println!("[TEST] Thinking ({}B)", content.len());
+                    }
                     StreamMessage::Text { content } => {
                         s.text += 1;
                         let preview: String = content.chars().take(160).collect();

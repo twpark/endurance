@@ -283,6 +283,8 @@ pub enum StreamMessage {
     Init { session_id: String },
     /// Text response chunk
     Text { content: String },
+    /// Extended thinking block (reasoning)
+    Thinking { content: String },
     /// Tool use started
     ToolUse { name: String, input: String },
     /// Tool execution result
@@ -1222,6 +1224,9 @@ IMPORTANT: Format your responses using Markdown for better readability:
                         debug_log(&format!("  >>> Init: session_id={}", session_id));
                         last_session_id = Some(session_id.clone());
                     }
+                    StreamMessage::Thinking { content } => {
+                        debug_log(&format!("  >>> Thinking: {} chars", content.len()));
+                    }
                     StreamMessage::Text { content } => {
                         let preview: String = content.chars().take(100).collect();
                         debug_log(&format!("  >>> Text: {} chars, preview: {:?}", content.len(), preview));
@@ -1376,6 +1381,15 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
             for item in content {
                 let item_type = item.get("type")?.as_str()?;
                 match item_type {
+                    "thinking" => {
+                        let thinking = item.get("thinking")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !thinking.is_empty() {
+                            return Some(StreamMessage::Thinking { content: thinking });
+                        }
+                    }
                     "text" => {
                         let text = item.get("text")?.as_str()?.to_string();
                         return Some(StreamMessage::Text { content: text });
