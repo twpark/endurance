@@ -717,19 +717,53 @@ fn handle_ccserver(tokens: Vec<String>) {
     if !discord_tokens.is_empty() {
         println!("  ▸ Discord      : {} bot(s)", discord_tokens.len());
     }
+
+    // Initialize Endurance DB + API server
+    let data_dir = dirs::home_dir()
+        .map(|h| h.join(".cokacdir"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let db = match services::storage::EnduranceDb::open(&data_dir) {
+        Ok(db) => {
+            println!("  ▸ Endurance DB : ✓ ({})", data_dir.join("endurance.db").display());
+            Some(std::sync::Arc::new(db))
+        }
+        Err(e) => {
+            eprintln!("  ▸ Endurance DB : ✗ ({})", e);
+            None
+        }
+    };
+    println!("  ▸ API Server   : http://0.0.0.0:3737");
     println!();
 
     if total == 1 && discord_tokens.is_empty() {
-        // Single Telegram bot — run directly
-        rt.block_on(services::telegram::run_bot(&tg_tokens[0], None));
+        // Single Telegram bot — run bot + API concurrently
+        rt.block_on(async {
+            if let Some(db) = db {
+                tokio::spawn(services::api::start_api(db, 3737));
+            }
+            services::telegram::run_bot(&tg_tokens[0], None).await;
+        });
     } else if total == 1 && tg_tokens.is_empty() {
-        // Single Discord bot — run bridge directly
+        // Single Discord bot — run bridge + API
         let args = vec![discord_tokens[0].clone()];
-        rt.block_on(services::messenger_bridge::run_bridge("discord", &args));
+        rt.block_on(async {
+            if let Some(db) = db {
+                tokio::spawn(services::api::start_api(db, 3737));
+            }
+            services::messenger_bridge::run_bridge("discord", &args).await;
+        });
     } else {
-        // Multiple bots — spawn all concurrently
+        // Multiple bots — spawn all concurrently + API
         rt.block_on(async {
             let mut handles = Vec::new();
+
+            // Start API server
+            if let Some(db) = db {
+                handles.push(tokio::spawn(async move {
+                    services::api::start_api(db, 3737).await;
+                }));
+            }
+
             for token in tg_tokens {
                 handles.push(tokio::spawn(async move {
                     services::telegram::run_bot(&token, None).await;

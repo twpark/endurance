@@ -13,3 +13,4 @@ pub mod session_archive;
 pub mod telegram;
 pub mod storage;
 pub mod api;
+pub mod user_api;
