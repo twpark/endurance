@@ -2341,25 +2341,31 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
             eprintln!("[endurance] Bot ready: chat={}, provider={}", chat_id_val, provider);
             let _ = tg!("send_message", bot.send_message(ChatId(chat_id_val), format!("🟢 Endurance v{}", version)).await);
 
-            // Check DB for recent bot activity
+            // Check DB for recent bot activity — log to file for debugging
             if let Some(db) = storage::get_db() {
                 let chat_str = chat_id_val.to_string();
-                if let Ok(msgs) = db.get_messages(&chat_str, None, 10) {
-                    let last_assistant = msgs.iter().rev()
-                        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
-                    if let Some(msg) = last_assistant {
-                        if let Some(ts) = msg.get("timestamp").and_then(|v| v.as_str()) {
-                            if let Ok(msg_time) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
-                                .map(|dt| dt.and_utc().fixed_offset())
-                                .or_else(|_| chrono::DateTime::parse_from_rfc3339(ts)) {
-                                let elapsed = chrono::Utc::now().signed_duration_since(msg_time);
-                                eprintln!("[endurance] chat={}, last assistant msg {}s ago", chat_id_val, elapsed.num_seconds());
-                                if elapsed.num_minutes() < 30 {
-                                    resume_chats.push(chat_id_val);
+                match db.get_messages(&chat_str, None, 10) {
+                    Ok(msgs) => {
+                        let last_assistant = msgs.iter().rev()
+                            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
+                        if let Some(msg) = last_assistant {
+                            if let Some(ts) = msg.get("timestamp").and_then(|v| v.as_str()) {
+                                if let Ok(msg_time) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+                                    .map(|dt| dt.and_utc().fixed_offset())
+                                    .or_else(|_| chrono::DateTime::parse_from_rfc3339(ts)) {
+                                    let elapsed = chrono::Utc::now().signed_duration_since(msg_time);
+                                    let secs = elapsed.num_seconds();
+                                    // Write to file so we can always check
+                                    let _ = std::fs::write("/tmp/endurance-resume.log",
+                                        format!("chat={} ts={} elapsed={}s resume={}\n", chat_id_val, ts, secs, secs < 1800));
+                                    if elapsed.num_minutes() < 30 {
+                                        resume_chats.push(chat_id_val);
+                                    }
                                 }
                             }
                         }
                     }
+                    _ => {}
                 }
             }
         }
@@ -2420,38 +2426,39 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
         }
     }
 
-    // Auto-resume: send AFTER flush so the message isn't discarded
-    if !resume_chats.is_empty() {
-        let resume_bot_username = bot_username.clone();
-        tokio::spawn(async move {
-            // Wait for polling loop to start receiving updates
-            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-            let client = reqwest::Client::new();
-            let proxy_urls = ["https://tg.parkoo.us", "http://localhost:3737"];
-            for chat_id_val in &resume_chats {
-                eprintln!("[endurance] Auto-resume for chat={}", chat_id_val);
-                let resume_msg = "재부팅됐다. 직전 컨텍스트 확인하고 미완성 작업 있으면 이어서 진행해.";
-                let mut sent = false;
-                for proxy_url in &proxy_urls {
-                    match client.post(format!("{}/send", proxy_url))
-                        .json(&serde_json::json!({ "peer": resume_bot_username, "text": resume_msg }))
-                        .timeout(std::time::Duration::from_secs(5))
-                        .send().await
-                    {
-                        Ok(resp) if resp.status().is_success() => {
-                            eprintln!("[endurance] Auto-resume sent via {} for chat={}", proxy_url, chat_id_val);
-                            sent = true;
-                            break;
-                        }
-                        Ok(resp) => eprintln!("[endurance] Auto-resume failed: {} status={}", proxy_url, resp.status()),
-                        Err(e) => eprintln!("[endurance] Auto-resume error: {} {}", proxy_url, e),
-                    }
-                }
-                if !sent {
-                    eprintln!("[endurance] Auto-resume: tg-proxy unreachable for chat={}", chat_id_val);
-                }
+    // Auto-resume: register a one-time cron schedule via endurance CLI
+    // This uses the proven cokacdir scheduler, no tg-proxy timing issues
+    for chat_id_val in &resume_chats {
+        eprintln!("[endurance] Auto-resume: registering one-time schedule for chat={}", chat_id_val);
+        let endurance_bin = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("cokacdir"));
+        // Find the key for this chat from settings
+        let key_for_chat = {
+            let data = state.lock().await;
+            // Use endurance key from schedule dir if available
+            None::<String> // Will use --key from schedule files
+        };
+        // Use the CLI to register a one-time schedule for 10s from now
+        let output = tokio::process::Command::new(&endurance_bin)
+            .arg("--cron")
+            .arg("재부팅됐다. 직전 컨텍스트 확인하고 미완성 작업 있으면 이어서 진행해.")
+            .arg("--at")
+            .arg("15s")
+            .arg("--chat")
+            .arg(chat_id_val.to_string())
+            .arg("--key")
+            .arg(token_hash(token))
+            .arg("--once")
+            .output()
+            .await;
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                eprintln!("[endurance] Auto-resume schedule registered: {}", stdout.trim());
             }
-        });
+            Err(e) => {
+                eprintln!("[endurance] Auto-resume schedule failed: {}", e);
+            }
+        }
     }
 
     // Run polling loop with automatic reconnection on network failure.
