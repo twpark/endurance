@@ -14,6 +14,7 @@ use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_
 use crate::services::codex;
 use crate::services::gemini;
 use crate::services::opencode;
+use crate::services::storage;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
 
 /// Global debug log flag for Telegram API calls
@@ -7038,6 +7039,17 @@ async fn handle_text_message(
         let mut placeholder_msg_id = placeholder_msg_id;
         let mut last_confirmed_len: usize = 0;
 
+        // Endurance DB tracking
+        let mut db_msg_id: Option<i64> = None;
+        let mut db_tool_id: Option<i64> = None;
+        let mut db_thinking_seq: i32 = 0;
+        let mut db_tool_seq: i32 = 0;
+
+        // Store user message
+        if let Some(db) = storage::get_db() {
+            let _ = db.store_message(&chat_id.0.to_string(), None, "user", &user_text_owned, None, None);
+        }
+
         let (polling_time_ms, silent_mode) = {
             let data = state_owned.lock().await;
             (data.polling_time_ms, is_silent(&data.settings, chat_id))
@@ -7070,11 +7082,23 @@ async fn handle_text_message(
                                 StreamMessage::Init { session_id: sid } => {
                                     msg_debug(&format!("[polling] Init: session_id={}", sid));
                                     ai_trace(&format!("[STREAM] Init: session_id={}", sid));
-                                    new_session_id = Some(sid);
+                                    new_session_id = Some(sid.clone());
+                                    // Create assistant message record in DB
+                                    if let Some(db) = storage::get_db() {
+                                        db_msg_id = db.store_message(
+                                            &chat_id.0.to_string(),
+                                            Some(&bot_username_for_log),
+                                            "assistant", "", None, Some(&sid),
+                                        ).ok();
+                                    }
                                 }
                                 StreamMessage::Thinking { content } => {
                                     // Capture thinking but don't send to Telegram
                                     msg_debug(&format!("[polling] Thinking: {} chars", content.len()));
+                                    if let (Some(db), Some(msg_id)) = (storage::get_db(), db_msg_id) {
+                                        let _ = db.store_reasoning(msg_id, &content, db_thinking_seq);
+                                        db_thinking_seq += 1;
+                                    }
                                 }
                                 StreamMessage::Text { content } => {
                                     msg_debug(&format!("[polling] Text: {} chars, preview={:?}",
@@ -7090,6 +7114,11 @@ async fn handle_text_message(
                                     pending_cokacdir = detect_cokacdir_command(&name, &input);
                                     suppress_tool_display = detect_chat_log_read(&name, &input);
                                     last_tool_name = name.clone();
+                                    // Store tool call in DB
+                                    if let (Some(db), Some(msg_id)) = (storage::get_db(), db_msg_id) {
+                                        db_tool_id = db.store_tool_call(msg_id, &name, &input, db_tool_seq).ok();
+                                        db_tool_seq += 1;
+                                    }
                                     let summary = format_tool_input(&name, &input);
                                     let ts = chrono::Local::now().format("%H:%M:%S");
                                     println!("  [{ts}]   ⚙ {name}: {summary}");
@@ -7120,6 +7149,11 @@ async fn handle_text_message(
                                     msg_debug(&format!("[polling] ToolResult: is_error={}, content_len={}, pending_cokacdir={}, last_tool={}", is_error, content.len(), pending_cokacdir, last_tool_name));
                                     if is_error {
                                         msg_debug(&format!("[polling] ToolResult ERROR: last_tool={}, content_preview={:?}", last_tool_name, truncate_str(&content, 300)));
+                                    }
+                                    // Store tool result in DB
+                                    if let (Some(db), Some(tool_id)) = (storage::get_db(), db_tool_id) {
+                                        let _ = db.update_tool_result(tool_id, &content, None);
+                                        db_tool_id = None;
                                     }
                                     raw_entries.push(RawPayloadEntry { tag: "ToolResult".into(), content: format!("is_error={}, content={}", is_error, content) });
                                     let _fr_before = full_response.len();
@@ -7440,6 +7474,11 @@ async fn handle_text_message(
                             msg_debug(&format!("[polling] JSONL: user entry written, assistant SKIPPED (raw_entries is empty)"));
                         }
                     }
+                }
+
+                // Update assistant message text in DB
+                if let (Some(db), Some(msg_id)) = (storage::get_db(), db_msg_id) {
+                    let _ = db.update_message_text(msg_id, &full_response);
                 }
 
                 let ts = chrono::Local::now().format("%H:%M:%S");

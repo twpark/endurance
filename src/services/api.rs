@@ -8,13 +8,13 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::storage::EnduranceDb;
+use super::storage::{self, EnduranceDb};
 
 pub struct ApiState {
-    pub db: Arc<EnduranceDb>,
+    pub db: &'static EnduranceDb,
 }
 
-pub fn create_router(db: Arc<EnduranceDb>) -> Router {
+pub fn create_router(db: &'static EnduranceDb) -> Router {
     let state = Arc::new(ApiState { db });
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -170,7 +170,8 @@ async fn get_usage() -> Json<Value> {
     }
 }
 
-pub async fn start_api(db: Arc<EnduranceDb>, port: u16) {
+pub async fn start_api(port: u16) {
+    let db = storage::get_db().expect("Endurance DB not initialized before start_api");
     let router = create_router(db);
     let addr = format!("0.0.0.0:{}", port);
     match tokio::net::TcpListener::bind(&addr).await {

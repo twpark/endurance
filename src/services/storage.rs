@@ -1,7 +1,19 @@
 use rusqlite::{Connection, params};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+static GLOBAL_DB: OnceLock<EnduranceDb> = OnceLock::new();
+
+pub fn init_global_db(data_dir: &PathBuf) -> Result<(), rusqlite::Error> {
+    let db = EnduranceDb::open(data_dir)?;
+    let _ = GLOBAL_DB.set(db);
+    Ok(())
+}
+
+pub fn get_db() -> Option<&'static EnduranceDb> {
+    GLOBAL_DB.get()
+}
 
 pub struct EnduranceDb {
     conn: Arc<Mutex<Connection>>,

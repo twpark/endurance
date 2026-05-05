@@ -722,14 +722,14 @@ fn handle_ccserver(tokens: Vec<String>) {
     let data_dir = dirs::home_dir()
         .map(|h| h.join(".cokacdir"))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let db = match services::storage::EnduranceDb::open(&data_dir) {
-        Ok(db) => {
+    let db_ok = match services::storage::init_global_db(&data_dir) {
+        Ok(()) => {
             println!("  ▸ Endurance DB : ✓ ({})", data_dir.join("endurance.db").display());
-            Some(std::sync::Arc::new(db))
+            true
         }
         Err(e) => {
             eprintln!("  ▸ Endurance DB : ✗ ({})", e);
-            None
+            false
         }
     };
     println!("  ▸ API Server   : http://0.0.0.0:3838");
@@ -738,8 +738,8 @@ fn handle_ccserver(tokens: Vec<String>) {
     if total == 1 && discord_tokens.is_empty() {
         // Single Telegram bot — run bot + API concurrently
         rt.block_on(async {
-            if let Some(db) = db {
-                tokio::spawn(services::api::start_api(db, 3838));
+            if db_ok {
+                tokio::spawn(services::api::start_api(3838));
             }
             services::telegram::run_bot(&tg_tokens[0], None).await;
         });
@@ -747,8 +747,8 @@ fn handle_ccserver(tokens: Vec<String>) {
         // Single Discord bot — run bridge + API
         let args = vec![discord_tokens[0].clone()];
         rt.block_on(async {
-            if let Some(db) = db {
-                tokio::spawn(services::api::start_api(db, 3838));
+            if db_ok {
+                tokio::spawn(services::api::start_api(3838));
             }
             services::messenger_bridge::run_bridge("discord", &args).await;
         });
@@ -758,9 +758,9 @@ fn handle_ccserver(tokens: Vec<String>) {
             let mut handles = Vec::new();
 
             // Start API server
-            if let Some(db) = db {
+            if db_ok {
                 handles.push(tokio::spawn(async move {
-                    services::api::start_api(db, 3838).await;
+                    services::api::start_api(3838).await;
                 }));
             }
 
