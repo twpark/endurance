@@ -732,14 +732,14 @@ fn handle_ccserver(tokens: Vec<String>) {
             None
         }
     };
-    println!("  ▸ API Server   : http://0.0.0.0:3737");
+    println!("  ▸ API Server   : http://0.0.0.0:3838");
     println!();
 
     if total == 1 && discord_tokens.is_empty() {
         // Single Telegram bot — run bot + API concurrently
         rt.block_on(async {
             if let Some(db) = db {
-                tokio::spawn(services::api::start_api(db, 3737));
+                tokio::spawn(services::api::start_api(db, 3838));
             }
             services::telegram::run_bot(&tg_tokens[0], None).await;
         });
@@ -748,7 +748,7 @@ fn handle_ccserver(tokens: Vec<String>) {
         let args = vec![discord_tokens[0].clone()];
         rt.block_on(async {
             if let Some(db) = db {
-                tokio::spawn(services::api::start_api(db, 3737));
+                tokio::spawn(services::api::start_api(db, 3838));
             }
             services::messenger_bridge::run_bridge("discord", &args).await;
         });
@@ -760,7 +760,7 @@ fn handle_ccserver(tokens: Vec<String>) {
             // Start API server
             if let Some(db) = db {
                 handles.push(tokio::spawn(async move {
-                    services::api::start_api(db, 3737).await;
+                    services::api::start_api(db, 3838).await;
                 }));
             }
 
