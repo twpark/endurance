@@ -2322,27 +2322,13 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
             .filter_map(|k| k.parse::<i64>().ok())
             .collect();
         let version = env!("CARGO_PKG_VERSION");
-        let update_notice = check_latest_version(version).await;
-        for cid in chat_ids {
-            let chat_id = ChatId(cid);
-            let last_path = data.settings.last_sessions.get(&cid.to_string())
-                .map(|p| p.as_str())
-                .unwrap_or("(unknown)");
-            let model = get_model(&data.settings, chat_id);
+        // Endurance: suppress startup message to Telegram (log only)
+        let _update_notice = check_latest_version(version).await;
+        for cid in &chat_ids {
+            let chat_id_val = *cid;
+            let model = get_model(&data.settings, ChatId(chat_id_val));
             let provider = detect_provider(model.as_deref());
-            let msg = if data.settings.greeting {
-                // Compact mode: single line with version and model
-                format!("🟢 cokacdir started (v{}, {})", version, provider)
-            } else {
-                // Full mode: marketing message with links
-                let mut m = format!("🟢 cokacdir started (v{}, {})\n📂 Resuming session at {}\n💬 Join @cokacvibe for tips, updates, and community support\n⭐ Star us on GitHub: https://github.com/kstost/cokacdir", version, provider, last_path);
-                if let Some(ref notice) = update_notice {
-                    m.push('\n');
-                    m.push_str(notice);
-                }
-                m
-            };
-            let _ = tg!("send_message", bot.send_message(chat_id, msg).await);
+            eprintln!("[endurance] Bot ready: chat={}, provider={}", chat_id_val, provider);
         }
     }
 
