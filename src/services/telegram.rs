@@ -2365,38 +2365,6 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
         }
     } // lock released
 
-    // Auto-resume after lock is released — send via tg-proxy as user message
-    for chat_id_val in &resume_chats {
-        eprintln!("[endurance] Auto-resume for chat={}", chat_id_val);
-        let resume_msg = "재부팅됐다. 직전 컨텍스트 확인하고 미완성 작업 있으면 이어서 진행해.";
-        let client = reqwest::Client::new();
-        let peer = bot_username.clone();
-        let proxy_urls = ["https://tg.parkoo.us", "http://localhost:3737"];
-        let mut sent = false;
-        for proxy_url in &proxy_urls {
-            match client.post(format!("{}/send", proxy_url))
-                .json(&serde_json::json!({ "peer": peer, "text": resume_msg }))
-                .timeout(std::time::Duration::from_secs(5))
-                .send().await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    eprintln!("[endurance] Auto-resume sent via {} for chat={}", proxy_url, chat_id_val);
-                    sent = true;
-                    break;
-                }
-                Ok(resp) => {
-                    eprintln!("[endurance] Auto-resume failed: {} status={}", proxy_url, resp.status());
-                }
-                Err(e) => {
-                    eprintln!("[endurance] Auto-resume error: {} {}", proxy_url, e);
-                }
-            }
-        }
-        if !sent {
-            eprintln!("[endurance] Auto-resume: tg-proxy unreachable for chat={}", chat_id_val);
-        }
-    }
-
     // Schedule workspace directories are preserved for user access via /start
 
     // Spawn scheduler loop
@@ -2450,6 +2418,40 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
             msg_debug(&format!("[run_bot] failed to flush pending updates: {}", e));
             println!("  ⚠ Failed to flush pending updates: {}", e);
         }
+    }
+
+    // Auto-resume: send AFTER flush so the message isn't discarded
+    if !resume_chats.is_empty() {
+        let resume_bot_username = bot_username.clone();
+        tokio::spawn(async move {
+            // Wait for polling loop to start receiving updates
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            let client = reqwest::Client::new();
+            let proxy_urls = ["https://tg.parkoo.us", "http://localhost:3737"];
+            for chat_id_val in &resume_chats {
+                eprintln!("[endurance] Auto-resume for chat={}", chat_id_val);
+                let resume_msg = "재부팅됐다. 직전 컨텍스트 확인하고 미완성 작업 있으면 이어서 진행해.";
+                let mut sent = false;
+                for proxy_url in &proxy_urls {
+                    match client.post(format!("{}/send", proxy_url))
+                        .json(&serde_json::json!({ "peer": resume_bot_username, "text": resume_msg }))
+                        .timeout(std::time::Duration::from_secs(5))
+                        .send().await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            eprintln!("[endurance] Auto-resume sent via {} for chat={}", proxy_url, chat_id_val);
+                            sent = true;
+                            break;
+                        }
+                        Ok(resp) => eprintln!("[endurance] Auto-resume failed: {} status={}", proxy_url, resp.status()),
+                        Err(e) => eprintln!("[endurance] Auto-resume error: {} {}", proxy_url, e),
+                    }
+                }
+                if !sent {
+                    eprintln!("[endurance] Auto-resume: tg-proxy unreachable for chat={}", chat_id_val);
+                }
+            }
+        });
     }
 
     // Run polling loop with automatic reconnection on network failure.
