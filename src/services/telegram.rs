@@ -2322,8 +2322,7 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
     println!("  ✓ Bot connected — Listening for messages");
     println!("  ✓ Scheduler started (5s interval)");
 
-    // Send startup greeting to known chats + collect resume candidates
-    let mut resume_chats: Vec<i64> = Vec::new();
+    // Send startup greeting to known chats
     {
         let data = state.lock().await;
         let chat_ids: Vec<i64> = data.settings.last_sessions.keys()
@@ -2340,36 +2339,8 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
             let provider = detect_provider(model.as_deref());
             eprintln!("[endurance] Bot ready: chat={}, provider={}", chat_id_val, provider);
             let _ = tg!("send_message", bot.send_message(ChatId(chat_id_val), format!("🟢 Endurance v{}", version)).await);
-
-            // Check DB for recent bot activity — log to file for debugging
-            if let Some(db) = storage::get_db() {
-                let chat_str = chat_id_val.to_string();
-                match db.get_messages(&chat_str, None, 10) {
-                    Ok(msgs) => {
-                        let last_assistant = msgs.iter().rev()
-                            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
-                        if let Some(msg) = last_assistant {
-                            if let Some(ts) = msg.get("timestamp").and_then(|v| v.as_str()) {
-                                if let Ok(msg_time) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
-                                    .map(|dt| dt.and_utc().fixed_offset())
-                                    .or_else(|_| chrono::DateTime::parse_from_rfc3339(ts)) {
-                                    let elapsed = chrono::Utc::now().signed_duration_since(msg_time);
-                                    let secs = elapsed.num_seconds();
-                                    // Write to file so we can always check
-                                    let _ = std::fs::write("/tmp/endurance-resume.log",
-                                        format!("chat={} ts={} elapsed={}s resume={}\n", chat_id_val, ts, secs, secs < 1800));
-                                    if elapsed.num_minutes() < 30 {
-                                        resume_chats.push(chat_id_val);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
         }
-    } // lock released
+    }
 
     // Schedule workspace directories are preserved for user access via /start
 
@@ -2426,40 +2397,8 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
         }
     }
 
-    // Auto-resume: register a one-time cron schedule via endurance CLI
-    // This uses the proven cokacdir scheduler, no tg-proxy timing issues
-    for chat_id_val in &resume_chats {
-        eprintln!("[endurance] Auto-resume: registering one-time schedule for chat={}", chat_id_val);
-        let endurance_bin = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("cokacdir"));
-        // Find the key for this chat from settings
-        let key_for_chat = {
-            let data = state.lock().await;
-            // Use endurance key from schedule dir if available
-            None::<String> // Will use --key from schedule files
-        };
-        // Use the CLI to register a one-time schedule for 10s from now
-        let output = tokio::process::Command::new(&endurance_bin)
-            .arg("--cron")
-            .arg("재부팅됐다. 직전 컨텍스트 확인하고 미완성 작업 있으면 이어서 진행해.")
-            .arg("--at")
-            .arg("15s")
-            .arg("--chat")
-            .arg(chat_id_val.to_string())
-            .arg("--key")
-            .arg(token_hash(token))
-            .arg("--once")
-            .output()
-            .await;
-        match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                eprintln!("[endurance] Auto-resume schedule registered: {}", stdout.trim());
-            }
-            Err(e) => {
-                eprintln!("[endurance] Auto-resume schedule failed: {}", e);
-            }
-        }
-    }
+    // Auto-resume is handled by endurance-start.sh wrapper (external script)
+    // See: ~/work/core/scripts/endurance-resume.sh
 
     // Run polling loop with automatic reconnection on network failure.
     // teloxide::repl may panic or exit silently when the network drops
