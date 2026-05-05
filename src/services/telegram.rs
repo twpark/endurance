@@ -2322,13 +2322,17 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
             .filter_map(|k| k.parse::<i64>().ok())
             .collect();
         let version = env!("CARGO_PKG_VERSION");
-        // Endurance: suppress startup message to Telegram (log only)
+        // Endurance: one clean startup line per chat
         let _update_notice = check_latest_version(version).await;
+        let mut notified_chats = std::collections::HashSet::new();
         for cid in &chat_ids {
             let chat_id_val = *cid;
+            if notified_chats.contains(&chat_id_val) { continue; }
+            notified_chats.insert(chat_id_val);
             let model = get_model(&data.settings, ChatId(chat_id_val));
             let provider = detect_provider(model.as_deref());
             eprintln!("[endurance] Bot ready: chat={}, provider={}", chat_id_val, provider);
+            let _ = tg!("send_message", bot.send_message(ChatId(chat_id_val), format!("🟢 Endurance v{}", version)).await);
         }
     }
 
