@@ -7054,6 +7054,7 @@ async fn handle_text_message(
         // Live status for Telegram placeholder (thinking/tool indicators)
         let mut live_status: Option<String> = None;
         let mut last_event_time = std::time::Instant::now();
+        let mut thinking_start: Option<std::time::Instant> = None;
         let mut stuck_warned = false;
 
         // Store user message
@@ -7116,8 +7117,12 @@ async fn handle_text_message(
                                 StreamMessage::Thinking { content } => {
                                     // Capture thinking but don't send to Telegram
                                     last_event_time = std::time::Instant::now();
+                                    if thinking_start.is_none() {
+                                        thinking_start = Some(std::time::Instant::now());
+                                    }
                                     msg_debug(&format!("[polling] Thinking: {} chars", content.len()));
-                                    live_status = Some("💭 Thinking...".to_string());
+                                    let secs = thinking_start.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                                    live_status = Some(format!("💭 {}s", secs));
                                     if let (Some(db), Some(msg_id)) = (storage::get_db(), db_msg_id) {
                                         let _ = db.store_reasoning(msg_id, &content, db_thinking_seq);
                                         db_thinking_seq += 1;
@@ -7137,6 +7142,7 @@ async fn handle_text_message(
                                         content.len(), truncate_str(&content, 80)));
                                     ai_trace(&format!("[STREAM] Text: {} chars, total_so_far={}", content.len(), full_response.len() + content.len()));
                                     live_status = None; // Clear thinking/tool indicator when text arrives
+                                    thinking_start = None;
                                     storage::emit_live(storage::LiveEvent {
                                         event_type: "text".into(),
                                         chat_id: chat_id.0.to_string(),
@@ -7403,6 +7409,10 @@ async fn handle_text_message(
                         // No new content — spinner update on current placeholder
                         let indicator = SPINNER[spin_idx % SPINNER.len()];
                         spin_idx += 1;
+                        // Update thinking timer on each poll cycle
+                        if let Some(ts) = thinking_start {
+                            live_status = Some(format!("💭 {}s", ts.elapsed().as_secs()));
+                        }
                         // Stuck detection: warn if no events for 3 minutes
                         let elapsed_secs = last_event_time.elapsed().as_secs();
                         let display_text = if elapsed_secs > 180 && !stuck_warned {
