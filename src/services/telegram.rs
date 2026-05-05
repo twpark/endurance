@@ -2322,7 +2322,7 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
     println!("  ✓ Bot connected — Listening for messages");
     println!("  ✓ Scheduler started (5s interval)");
 
-    // Send startup greeting to known chats
+    // Send startup greeting to known chats (with auto-followup for recent activity)
     {
         let data = state.lock().await;
         let chat_ids: Vec<i64> = data.settings.last_sessions.keys()
@@ -2339,7 +2339,54 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
             let model = get_model(&data.settings, ChatId(chat_id_val));
             let provider = detect_provider(model.as_deref());
             eprintln!("[endurance] Bot ready: chat={}, provider={}", chat_id_val, provider);
+
+            // Check DB for recent activity — if last message was < 5 min ago, auto-resume
+            let should_resume = if let Some(db) = storage::get_db() {
+                let chat_str = chat_id_val.to_string();
+                match db.get_messages(&chat_str, None, 1) {
+                    Ok(msgs) if !msgs.is_empty() => {
+                        if let Some(ts) = msgs[0].get("timestamp").and_then(|v| v.as_str()) {
+                            if let Ok(msg_time) = chrono::DateTime::parse_from_rfc3339(ts)
+                                .or_else(|_| chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+                                    .map(|dt| dt.and_utc().fixed_offset())) {
+                                let elapsed = chrono::Utc::now().signed_duration_since(msg_time);
+                                elapsed.num_minutes() < 5
+                            } else { false }
+                        } else { false }
+                    }
+                    _ => false,
+                }
+            } else { false };
+
             let _ = tg!("send_message", bot.send_message(ChatId(chat_id_val), format!("🟢 Endurance v{}", version)).await);
+
+            // Auto-resume: send a message via tg-proxy as the user, so it triggers normal AI processing
+            if should_resume {
+                eprintln!("[endurance] Recent activity detected for chat={}, auto-resuming via tg-proxy", chat_id_val);
+                let resume_msg = "재부팅됐다. 직전 컨텍스트 확인하고 미완성 작업 있으면 이어서 진행해.";
+                let client = reqwest::Client::new();
+                let peer = bot_username.clone();
+                // Try tg-proxy to send as user (so bot receives it as a normal message)
+                let proxy_urls = ["https://tg.parkoo.us", "http://localhost:3737"];
+                let mut sent = false;
+                for proxy_url in &proxy_urls {
+                    match client.post(format!("{}/send", proxy_url))
+                        .json(&serde_json::json!({ "peer": peer, "text": resume_msg }))
+                        .timeout(std::time::Duration::from_secs(5))
+                        .send().await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            eprintln!("[endurance] Auto-resume sent via {}", proxy_url);
+                            sent = true;
+                            break;
+                        }
+                        _ => continue,
+                    }
+                }
+                if !sent {
+                    eprintln!("[endurance] Auto-resume: tg-proxy unreachable, skipping");
+                }
+            }
         }
     }
 
@@ -2926,23 +2973,22 @@ async fn handle_message(
         if let Some((can_queue, queue_on, queue_result)) = busy_info {
             if can_queue {
                 shared_rate_limit_wait(&state, chat_id).await;
-                if let Some((qid, qtxt)) = queue_result {
-                    let preview = truncate_str(&qtxt, 30);
-                    tg!("send_message", bot.send_message(chat_id, &format!("Queued ({qid}) \"{preview}\"\n- /stopall to cancel all\n- /stop_{qid} to cancel this"))
+                if let Some((qid, _qtxt)) = queue_result {
+                    // Compact queue feedback — minimal interruption
+                    let queue_len = {
+                        let data = state.lock().await;
+                        data.message_queues.get(&chat_id).map_or(0, |q| q.len())
+                    };
+                    tg!("send_message", bot.send_message(chat_id, &format!("📨 queued (+{}) — /stop_{qid}", queue_len))
                         .await)?;
                 } else {
-                    tg!("send_message", bot.send_message(chat_id, &format!("Queue full (max {}). Use /stopall to clear.", MAX_QUEUE_SIZE))
+                    tg!("send_message", bot.send_message(chat_id, "📨 queue full. /stopall")
                         .await)?;
                 }
             } else {
                 shared_rate_limit_wait(&state, chat_id).await;
-                if queue_on {
-                    tg!("send_message", bot.send_message(chat_id, "AI request in progress. This command cannot be queued. Use /stop to cancel current, /stopall to cancel all.")
-                        .await)?;
-                } else {
-                    tg!("send_message", bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.")
-                        .await)?;
-                }
+                tg!("send_message", bot.send_message(chat_id, "⏳ working... /stop to cancel")
+                    .await)?;
             }
             return Ok(());
         }
