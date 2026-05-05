@@ -7051,6 +7051,9 @@ async fn handle_text_message(
         let mut db_thinking_seq: i32 = 0;
         let mut db_tool_seq: i32 = 0;
 
+        // Live status for Telegram placeholder (thinking/tool indicators)
+        let mut live_status: Option<String> = None;
+
         // Store user message
         if let Some(db) = storage::get_db() {
             let _ = db.store_message(&chat_id.0.to_string(), None, "user", &user_text_owned, None, None);
@@ -7109,6 +7112,7 @@ async fn handle_text_message(
                                 StreamMessage::Thinking { content } => {
                                     // Capture thinking but don't send to Telegram
                                     msg_debug(&format!("[polling] Thinking: {} chars", content.len()));
+                                    live_status = Some("💭 Thinking...".to_string());
                                     if let (Some(db), Some(msg_id)) = (storage::get_db(), db_msg_id) {
                                         let _ = db.store_reasoning(msg_id, &content, db_thinking_seq);
                                         db_thinking_seq += 1;
@@ -7126,6 +7130,7 @@ async fn handle_text_message(
                                     msg_debug(&format!("[polling] Text: {} chars, preview={:?}",
                                         content.len(), truncate_str(&content, 80)));
                                     ai_trace(&format!("[STREAM] Text: {} chars, total_so_far={}", content.len(), full_response.len() + content.len()));
+                                    live_status = None; // Clear thinking/tool indicator when text arrives
                                     storage::emit_live(storage::LiveEvent {
                                         event_type: "text".into(),
                                         chat_id: chat_id.0.to_string(),
@@ -7144,6 +7149,7 @@ async fn handle_text_message(
                                     pending_cokacdir = detect_cokacdir_command(&name, &input);
                                     suppress_tool_display = detect_chat_log_read(&name, &input);
                                     last_tool_name = name.clone();
+                                    live_status = Some(format!("🔧 {}", name));
                                     // Store tool call in DB
                                     if let (Some(db), Some(msg_id)) = (storage::get_db(), db_msg_id) {
                                         db_tool_id = db.store_tool_call(msg_id, &name, &input, db_tool_seq).ok();
@@ -7374,7 +7380,11 @@ async fn handle_text_message(
                         // No new content — spinner update on current placeholder
                         let indicator = SPINNER[spin_idx % SPINNER.len()];
                         spin_idx += 1;
-                        let display_text = indicator.to_string();
+                        let display_text = if let Some(ref status) = live_status {
+                            status.clone()
+                        } else {
+                            indicator.to_string()
+                        };
                         if display_text != last_edit_text {
                             shared_rate_limit_wait(&state_owned, chat_id).await;
                             let html_text = markdown_to_telegram_html(&display_text);
