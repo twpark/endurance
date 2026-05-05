@@ -2340,17 +2340,23 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
             let provider = detect_provider(model.as_deref());
             eprintln!("[endurance] Bot ready: chat={}, provider={}", chat_id_val, provider);
 
-            // Check DB for recent activity — if last message was < 5 min ago, auto-resume
+            // Check DB for recent bot activity — if last assistant message was < 30 min ago, auto-resume
             let should_resume = if let Some(db) = storage::get_db() {
                 let chat_str = chat_id_val.to_string();
-                match db.get_messages(&chat_str, None, 1) {
-                    Ok(msgs) if !msgs.is_empty() => {
-                        if let Some(ts) = msgs[0].get("timestamp").and_then(|v| v.as_str()) {
-                            if let Ok(msg_time) = chrono::DateTime::parse_from_rfc3339(ts)
-                                .or_else(|_| chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
-                                    .map(|dt| dt.and_utc().fixed_offset())) {
-                                let elapsed = chrono::Utc::now().signed_duration_since(msg_time);
-                                elapsed.num_minutes() < 5
+                // Get recent messages and find the last assistant message
+                match db.get_messages(&chat_str, None, 10) {
+                    Ok(msgs) => {
+                        let last_assistant = msgs.iter().rev()
+                            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
+                        if let Some(msg) = last_assistant {
+                            if let Some(ts) = msg.get("timestamp").and_then(|v| v.as_str()) {
+                                if let Ok(msg_time) = chrono::DateTime::parse_from_rfc3339(ts)
+                                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+                                        .map(|dt| dt.and_utc().fixed_offset())) {
+                                    let elapsed = chrono::Utc::now().signed_duration_since(msg_time);
+                                    eprintln!("[endurance] chat={}, last assistant msg {}s ago", chat_id_val, elapsed.num_seconds());
+                                    elapsed.num_minutes() < 30
+                                } else { false }
                             } else { false }
                         } else { false }
                     }
