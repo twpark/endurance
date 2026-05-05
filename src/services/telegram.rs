@@ -2979,15 +2979,23 @@ async fn handle_message(
                         let data = state.lock().await;
                         data.message_queues.get(&chat_id).map_or(0, |q| q.len())
                     };
-                    tg!("send_message", bot.send_message(chat_id, &format!("📨 queued (+{}) — /stop_{qid}", queue_len))
+                    // Natural queue feedback with current live status
+                    let status_hint = if let Some(db) = storage::get_db() {
+                        // Check what the bot is currently doing via live_status pattern
+                        String::new() // live_status is per-task, not accessible here; keep simple
+                    } else {
+                        String::new()
+                    };
+                    drop(status_hint);
+                    tg!("send_message", bot.send_message(chat_id, &format!("👌 알겠어, 끝나면 바로 볼게 (+{}) /stop_{qid}", queue_len))
                         .await)?;
                 } else {
-                    tg!("send_message", bot.send_message(chat_id, "📨 queue full. /stopall")
+                    tg!("send_message", bot.send_message(chat_id, "📨 큐 꽉 참. /stopall")
                         .await)?;
                 }
             } else {
                 shared_rate_limit_wait(&state, chat_id).await;
-                tg!("send_message", bot.send_message(chat_id, "⏳ working... /stop to cancel")
+                tg!("send_message", bot.send_message(chat_id, "⏳ 작업 중... /stop 으로 취소 가능")
                     .await)?;
             }
             return Ok(());
@@ -6704,7 +6712,7 @@ fn process_next_queued_message<'a>(
         if let Some(queued) = next_msg {
             msg_debug(&format!("[queue:next] chat_id={}, dispatching id={}, text={:?}", chat_id.0, queued.id, truncate_str(&queued.text, 60)));
             shared_rate_limit_wait(state, chat_id).await;
-            let _ = tg!("send_message", bot.send_message(chat_id, &format!("Dequeued ({})", queued.id)).await);
+            let _ = tg!("send_message", bot.send_message(chat_id, "📩 이어서 처리 중...").await);
 
             if let Err(e) = handle_text_message(bot, chat_id, &queued.text, state, &queued.user_display_name, true).await {
                 msg_debug(&format!("[queue:next] chat_id={}, id={}, handle_text_message FAILED: {}", chat_id.0, queued.id, e));
