@@ -2322,14 +2322,14 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
     println!("  ✓ Bot connected — Listening for messages");
     println!("  ✓ Scheduler started (5s interval)");
 
-    // Send startup greeting to known chats (with auto-followup for recent activity)
+    // Send startup greeting to known chats + collect resume candidates
+    let mut resume_chats: Vec<i64> = Vec::new();
     {
         let data = state.lock().await;
         let chat_ids: Vec<i64> = data.settings.last_sessions.keys()
             .filter_map(|k| k.parse::<i64>().ok())
             .collect();
         let version = env!("CARGO_PKG_VERSION");
-        // Endurance: one clean startup line per chat
         let _update_notice = check_latest_version(version).await;
         let mut notified_chats = std::collections::HashSet::new();
         for cid in &chat_ids {
@@ -2339,60 +2339,61 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
             let model = get_model(&data.settings, ChatId(chat_id_val));
             let provider = detect_provider(model.as_deref());
             eprintln!("[endurance] Bot ready: chat={}, provider={}", chat_id_val, provider);
-
-            // Check DB for recent bot activity — if last assistant message was < 30 min ago, auto-resume
-            let should_resume = if let Some(db) = storage::get_db() {
-                let chat_str = chat_id_val.to_string();
-                // Get recent messages and find the last assistant message
-                match db.get_messages(&chat_str, None, 10) {
-                    Ok(msgs) => {
-                        let last_assistant = msgs.iter().rev()
-                            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
-                        if let Some(msg) = last_assistant {
-                            if let Some(ts) = msg.get("timestamp").and_then(|v| v.as_str()) {
-                                if let Ok(msg_time) = chrono::DateTime::parse_from_rfc3339(ts)
-                                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
-                                        .map(|dt| dt.and_utc().fixed_offset())) {
-                                    let elapsed = chrono::Utc::now().signed_duration_since(msg_time);
-                                    eprintln!("[endurance] chat={}, last assistant msg {}s ago", chat_id_val, elapsed.num_seconds());
-                                    elapsed.num_minutes() < 30
-                                } else { false }
-                            } else { false }
-                        } else { false }
-                    }
-                    _ => false,
-                }
-            } else { false };
-
             let _ = tg!("send_message", bot.send_message(ChatId(chat_id_val), format!("🟢 Endurance v{}", version)).await);
 
-            // Auto-resume: send a message via tg-proxy as the user, so it triggers normal AI processing
-            if should_resume {
-                eprintln!("[endurance] Recent activity detected for chat={}, auto-resuming via tg-proxy", chat_id_val);
-                let resume_msg = "재부팅됐다. 직전 컨텍스트 확인하고 미완성 작업 있으면 이어서 진행해.";
-                let client = reqwest::Client::new();
-                let peer = bot_username.clone();
-                // Try tg-proxy to send as user (so bot receives it as a normal message)
-                let proxy_urls = ["https://tg.parkoo.us", "http://localhost:3737"];
-                let mut sent = false;
-                for proxy_url in &proxy_urls {
-                    match client.post(format!("{}/send", proxy_url))
-                        .json(&serde_json::json!({ "peer": peer, "text": resume_msg }))
-                        .timeout(std::time::Duration::from_secs(5))
-                        .send().await
-                    {
-                        Ok(resp) if resp.status().is_success() => {
-                            eprintln!("[endurance] Auto-resume sent via {}", proxy_url);
-                            sent = true;
-                            break;
+            // Check DB for recent bot activity
+            if let Some(db) = storage::get_db() {
+                let chat_str = chat_id_val.to_string();
+                if let Ok(msgs) = db.get_messages(&chat_str, None, 10) {
+                    let last_assistant = msgs.iter().rev()
+                        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
+                    if let Some(msg) = last_assistant {
+                        if let Some(ts) = msg.get("timestamp").and_then(|v| v.as_str()) {
+                            if let Ok(msg_time) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+                                .map(|dt| dt.and_utc().fixed_offset())
+                                .or_else(|_| chrono::DateTime::parse_from_rfc3339(ts)) {
+                                let elapsed = chrono::Utc::now().signed_duration_since(msg_time);
+                                eprintln!("[endurance] chat={}, last assistant msg {}s ago", chat_id_val, elapsed.num_seconds());
+                                if elapsed.num_minutes() < 30 {
+                                    resume_chats.push(chat_id_val);
+                                }
+                            }
                         }
-                        _ => continue,
                     }
                 }
-                if !sent {
-                    eprintln!("[endurance] Auto-resume: tg-proxy unreachable, skipping");
+            }
+        }
+    } // lock released
+
+    // Auto-resume after lock is released — send via tg-proxy as user message
+    for chat_id_val in &resume_chats {
+        eprintln!("[endurance] Auto-resume for chat={}", chat_id_val);
+        let resume_msg = "재부팅됐다. 직전 컨텍스트 확인하고 미완성 작업 있으면 이어서 진행해.";
+        let client = reqwest::Client::new();
+        let peer = bot_username.clone();
+        let proxy_urls = ["https://tg.parkoo.us", "http://localhost:3737"];
+        let mut sent = false;
+        for proxy_url in &proxy_urls {
+            match client.post(format!("{}/send", proxy_url))
+                .json(&serde_json::json!({ "peer": peer, "text": resume_msg }))
+                .timeout(std::time::Duration::from_secs(5))
+                .send().await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    eprintln!("[endurance] Auto-resume sent via {} for chat={}", proxy_url, chat_id_val);
+                    sent = true;
+                    break;
+                }
+                Ok(resp) => {
+                    eprintln!("[endurance] Auto-resume failed: {} status={}", proxy_url, resp.status());
+                }
+                Err(e) => {
+                    eprintln!("[endurance] Auto-resume error: {} {}", proxy_url, e);
                 }
             }
+        }
+        if !sent {
+            eprintln!("[endurance] Auto-resume: tg-proxy unreachable for chat={}", chat_id_val);
         }
     }
 
