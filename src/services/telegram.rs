@@ -7053,6 +7053,8 @@ async fn handle_text_message(
 
         // Live status for Telegram placeholder (thinking/tool indicators)
         let mut live_status: Option<String> = None;
+        let mut last_event_time = std::time::Instant::now();
+        let mut stuck_warned = false;
 
         // Store user message
         if let Some(db) = storage::get_db() {
@@ -7089,6 +7091,8 @@ async fn handle_text_message(
                         Ok(msg) => {
                             match msg {
                                 StreamMessage::Init { session_id: sid } => {
+                                    last_event_time = std::time::Instant::now();
+                                    stuck_warned = false;
                                     msg_debug(&format!("[polling] Init: session_id={}", sid));
                                     ai_trace(&format!("[STREAM] Init: session_id={}", sid));
                                     new_session_id = Some(sid.clone());
@@ -7111,6 +7115,7 @@ async fn handle_text_message(
                                 }
                                 StreamMessage::Thinking { content } => {
                                     // Capture thinking but don't send to Telegram
+                                    last_event_time = std::time::Instant::now();
                                     msg_debug(&format!("[polling] Thinking: {} chars", content.len()));
                                     live_status = Some("💭 Thinking...".to_string());
                                     if let (Some(db), Some(msg_id)) = (storage::get_db(), db_msg_id) {
@@ -7127,6 +7132,7 @@ async fn handle_text_message(
                                     });
                                 }
                                 StreamMessage::Text { content } => {
+                                    last_event_time = std::time::Instant::now();
                                     msg_debug(&format!("[polling] Text: {} chars, preview={:?}",
                                         content.len(), truncate_str(&content, 80)));
                                     ai_trace(&format!("[STREAM] Text: {} chars, total_so_far={}", content.len(), full_response.len() + content.len()));
@@ -7146,10 +7152,26 @@ async fn handle_text_message(
                                         chat_id.0, content.len(), truncate_str(&content, 200), full_response.len(), _fr_before));
                                 }
                                 StreamMessage::ToolUse { name, input } => {
+                                    last_event_time = std::time::Instant::now();
                                     pending_cokacdir = detect_cokacdir_command(&name, &input);
                                     suppress_tool_display = detect_chat_log_read(&name, &input);
                                     last_tool_name = name.clone();
-                                    live_status = Some(format!("🔧 {}", name));
+                                    // Richer status for Agent/subagent tools
+                                    if name == "Agent" || name == "Task" {
+                                        let desc = serde_json::from_str::<serde_json::Value>(&input).ok()
+                                            .and_then(|v| v.get("description").and_then(|d| d.as_str()).map(String::from))
+                                            .unwrap_or_default();
+                                        let bg = serde_json::from_str::<serde_json::Value>(&input).ok()
+                                            .and_then(|v| v.get("run_in_background").and_then(|b| b.as_bool()))
+                                            .unwrap_or(false);
+                                        if !desc.is_empty() {
+                                            live_status = Some(format!("🤖 {}{}", desc, if bg { " (bg)" } else { "" }));
+                                        } else {
+                                            live_status = Some("🤖 Agent...".to_string());
+                                        }
+                                    } else {
+                                        live_status = Some(format!("🔧 {}", name));
+                                    }
                                     // Store tool call in DB
                                     if let (Some(db), Some(msg_id)) = (storage::get_db(), db_msg_id) {
                                         db_tool_id = db.store_tool_call(msg_id, &name, &input, db_tool_seq).ok();
@@ -7190,6 +7212,7 @@ async fn handle_text_message(
                                     }
                                 }
                                 StreamMessage::ToolResult { content, is_error } => {
+                                    last_event_time = std::time::Instant::now();
                                     msg_debug(&format!("[polling] ToolResult: is_error={}, content_len={}, pending_cokacdir={}, last_tool={}", is_error, content.len(), pending_cokacdir, last_tool_name));
                                     if is_error {
                                         msg_debug(&format!("[polling] ToolResult ERROR: last_tool={}, content_preview={:?}", last_tool_name, truncate_str(&content, 300)));
@@ -7380,7 +7403,16 @@ async fn handle_text_message(
                         // No new content — spinner update on current placeholder
                         let indicator = SPINNER[spin_idx % SPINNER.len()];
                         spin_idx += 1;
-                        let display_text = if let Some(ref status) = live_status {
+                        // Stuck detection: warn if no events for 3 minutes
+                        let elapsed_secs = last_event_time.elapsed().as_secs();
+                        let display_text = if elapsed_secs > 180 && !stuck_warned {
+                            stuck_warned = true;
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            println!("  [{ts}]   ⚠ No stream events for {}s — possible stuck", elapsed_secs);
+                            format!("⚠️ {}m no response...", elapsed_secs / 60)
+                        } else if elapsed_secs > 180 {
+                            format!("⚠️ {}m no response...", elapsed_secs / 60)
+                        } else if let Some(ref status) = live_status {
                             status.clone()
                         } else {
                             indicator.to_string()
