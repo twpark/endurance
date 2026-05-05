@@ -516,6 +516,7 @@ struct ScheduleEntry {
     last_run: Option<String>, // "2026-02-23 14:00:00"
     created_at: String,
     context_summary: Option<String>, // context summary text for session-isolated schedule
+    silent: bool,                     // silent cron: no Telegram output, DB only
 }
 
 /// Directory for schedule files: ~/.cokacdir/schedule/
@@ -805,6 +806,7 @@ fn read_schedule_entry(path: &std::path::Path) -> Option<ScheduleEntry> {
         last_run: v.get("last_run").and_then(|v| v.as_str()).map(String::from),
         created_at: v.get("created_at")?.as_str()?.to_string(),
         context_summary: v.get("context_summary").and_then(|v| v.as_str()).map(String::from),
+        silent: v.get("silent").and_then(|v| v.as_bool()).unwrap_or(true),
     });
     sched_debug(&format!("[read_schedule_entry] result: id={}, type={}, schedule={}, last_run={:?}",
         entry.as_ref().map(|e| e.id.as_str()).unwrap_or("?"),
@@ -832,6 +834,7 @@ fn write_schedule_entry(entry: &ScheduleEntry) -> Result<(), String> {
         "last_run": entry.last_run,
         "created_at": entry.created_at,
         "context_summary": entry.context_summary,
+        "silent": entry.silent,
     });
     if let Some(once_val) = entry.once {
         json.as_object_mut().unwrap().insert("once".to_string(), serde_json::json!(once_val));
@@ -1031,6 +1034,7 @@ pub struct ScheduleEntryData {
     pub last_run: Option<String>,
     pub created_at: String,
     pub context_summary: Option<String>,
+    pub silent: bool,
 }
 
 impl From<&ScheduleEntry> for ScheduleEntryData {
@@ -1047,6 +1051,7 @@ impl From<&ScheduleEntry> for ScheduleEntryData {
             last_run: e.last_run.clone(),
             created_at: e.created_at.clone(),
             context_summary: e.context_summary.clone(),
+            silent: e.silent,
         }
     }
 }
@@ -1065,6 +1070,7 @@ impl From<&ScheduleEntryData> for ScheduleEntry {
             last_run: d.last_run.clone(),
             created_at: d.created_at.clone(),
             context_summary: d.context_summary.clone(),
+            silent: d.silent,
         }
     }
 }
@@ -9112,32 +9118,37 @@ async fn execute_schedule(
     };
 
     // Send placeholder (show only the user's original prompt, not the context summary)
-    shared_rate_limit_wait(state, chat_id).await;
-    let placeholder = match tg!("send_message", bot.send_message(chat_id, format!("⏰ {user_prompt}")).await) {
-        Ok(msg) => msg,
-        Err(e) => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] ⚠ [Schedule] Failed to send placeholder: {e}");
-            // Clean up pending + cancel_token, restore session (workspace preserved)
-            {
-                let mut data = state.lock().await;
-                if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
-                    set.remove(&schedule_id);
+    let is_silent_cron = entry.silent;
+    let placeholder_msg_id = if !is_silent_cron {
+        shared_rate_limit_wait(state, chat_id).await;
+        match tg!("send_message", bot.send_message(chat_id, format!("⏰ {user_prompt}")).await) {
+            Ok(msg) => Some(msg.id),
+            Err(e) => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] ⚠ [Schedule] Failed to send placeholder: {e}");
+                // Clean up pending + cancel_token, restore session (workspace preserved)
+                {
+                    let mut data = state.lock().await;
+                    if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
+                        set.remove(&schedule_id);
+                    }
+                    data.cancel_tokens.remove(&chat_id);
+                    if let Some(prev) = prev_session {
+                        data.sessions.insert(chat_id, prev);
+                    } else {
+                        data.sessions.remove(&chat_id);
+                    }
                 }
-                data.cancel_tokens.remove(&chat_id);
-                if let Some(prev) = prev_session {
-                    data.sessions.insert(chat_id, prev);
-                } else {
-                    data.sessions.remove(&chat_id);
-                }
+                msg_debug(&format!("[queue:trigger] chat_id={}, source=schedule_placeholder_error", chat_id.0));
+                drop(group_lock); // release before queue processing to avoid deadlock
+                process_next_queued_message(bot, chat_id, state).await;
+                return;
             }
-            msg_debug(&format!("[queue:trigger] chat_id={}, source=schedule_placeholder_error", chat_id.0));
-            drop(group_lock); // release before queue processing to avoid deadlock
-            process_next_queued_message(bot, chat_id, state).await;
-            return;
         }
+    } else {
+        eprintln!("[endurance] Silent cron: {} (chat {})", schedule_id, chat_id.0);
+        None
     };
-    let placeholder_msg_id = placeholder.id;
 
     // Build disabled tools notice
     let default_tools: std::collections::HashSet<&str> = DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
@@ -9302,7 +9313,7 @@ async fn execute_schedule(
         let mut suppress_tool_display = false;
         let mut last_tool_name: String = String::new();
         let mut exec_session_id: Option<String> = None;
-        let mut placeholder_msg_id = placeholder_msg_id;
+        let mut placeholder_msg_id: Option<teloxide::types::MessageId> = placeholder_msg_id;
         let mut last_confirmed_len: usize = 0;
 
         let (polling_time_ms, silent_mode) = {
@@ -9485,8 +9496,9 @@ async fn execute_schedule(
                 }
             }
 
-            // Update placeholder with progress
-            if !done {
+            // Update placeholder with progress (skip in silent cron mode)
+            if !done && !is_silent_cron {
+                if let Some(ph_msg_id) = placeholder_msg_id {
                 // ── Rolling placeholder pattern (unified for all chats) ──
                 let threshold = file_attach_threshold();
                 let delta_end = floor_char_boundary(&full_response, full_response.len().min(threshold));
@@ -9495,37 +9507,37 @@ async fn execute_schedule(
                     let normalized_delta = normalize_empty_lines(delta);
                     let html_delta = markdown_to_telegram_html(&normalized_delta);
                     if html_delta.trim().is_empty() {
-                        msg_debug(&format!("[rolling_ph/sched] SKIP empty delta: placeholder_msg_id={}, delta_bytes={}, confirmed={}→{}",
-                            placeholder_msg_id, delta.len(), last_confirmed_len, delta_end));
+                        msg_debug(&format!("[rolling_ph/sched] SKIP empty delta: placeholder_msg_id={:?}, delta_bytes={}, confirmed={}→{}",
+                            ph_msg_id, delta.len(), last_confirmed_len, delta_end));
                         last_confirmed_len = delta_end;
                     } else {
-                        msg_debug(&format!("[rolling_ph/sched] EDIT delta: placeholder_msg_id={}, delta_len={}, html_len={}, confirmed={}→{}",
-                            placeholder_msg_id, normalized_delta.len(), html_delta.len(), last_confirmed_len, delta_end));
+                        msg_debug(&format!("[rolling_ph/sched] EDIT delta: placeholder_msg_id={:?}, delta_len={}, html_len={}, confirmed={}→{}",
+                            ph_msg_id, normalized_delta.len(), html_delta.len(), last_confirmed_len, delta_end));
                         shared_rate_limit_wait(&state_owned, chat_id).await;
                         if html_delta.len() <= TELEGRAM_MSG_LIMIT {
-                            let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_delta)
+                            let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, ph_msg_id, &html_delta)
                                 .parse_mode(ParseMode::Html).await);
                         } else {
                             if send_long_message(&bot_owned, chat_id, &html_delta, Some(ParseMode::Html), &state_owned).await.is_ok() {
                                 shared_rate_limit_wait(&state_owned, chat_id).await;
-                                let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                                let _ = tg!("delete_message", bot_owned.delete_message(chat_id, ph_msg_id).await);
                             } else {
                                 let truncated_delta = truncate_str(&normalized_delta, TELEGRAM_MSG_LIMIT);
-                                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &truncated_delta).await);
+                                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, ph_msg_id, &truncated_delta).await);
                             }
                         }
                         last_confirmed_len = delta_end;
-                        let old_ph_id = placeholder_msg_id;
+                        let old_ph_id = ph_msg_id;
                         shared_rate_limit_wait(&state_owned, chat_id).await;
                         match tg!("send_message", bot_owned.send_message(chat_id, "...").await) {
                             Ok(new_ph) => {
-                                placeholder_msg_id = new_ph.id;
-                                msg_debug(&format!("[rolling_ph/sched] NEW placeholder: old_msg_id={}, new_msg_id={}", old_ph_id, placeholder_msg_id));
+                                placeholder_msg_id = Some(new_ph.id);
+                                msg_debug(&format!("[rolling_ph/sched] NEW placeholder: old_msg_id={:?}, new_msg_id={:?}", old_ph_id, placeholder_msg_id));
                             }
                             Err(e) => {
                                 let ts = chrono::Local::now().format("%H:%M:%S");
                                 println!("  [{ts}]   ⚠ new placeholder failed (schedule): {e}");
-                                msg_debug(&format!("[rolling_ph/sched] NEW placeholder FAILED: keeping msg_id={}, err={}", placeholder_msg_id, e));
+                                msg_debug(&format!("[rolling_ph/sched] NEW placeholder FAILED: keeping msg_id={:?}, err={}", placeholder_msg_id, e));
                             }
                         }
                         last_edit_text.clear();
@@ -9538,7 +9550,7 @@ async fn execute_schedule(
                     if display_text != last_edit_text {
                         shared_rate_limit_wait(&state_owned, chat_id).await;
                         let html_text = markdown_to_telegram_html(&display_text);
-                        let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_text)
+                        let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, ph_msg_id, &html_text)
                             .parse_mode(ParseMode::Html).await);
                         last_edit_text = display_text;
                     } else {
@@ -9546,6 +9558,7 @@ async fn execute_schedule(
                         let _ = tg!("send_chat_action", bot_owned.send_chat_action(chat_id, teloxide::types::ChatAction::Typing).await);
                     }
                 }
+                } // if let Some(ph_msg_id)
             }
 
             // Queue processing
@@ -9556,9 +9569,33 @@ async fn execute_schedule(
         }
 
         // Final response
-        sched_debug(&format!("[execute_schedule] id={}, polling done: cancelled={}, had_error={}, response_len={}",
-            schedule_id, cancelled, had_error, full_response.len()));
-        if cancelled {
+        sched_debug(&format!("[execute_schedule] id={}, polling done: cancelled={}, had_error={}, response_len={}, is_silent_cron={}",
+            schedule_id, cancelled, had_error, full_response.len(), is_silent_cron));
+
+        // Silent cron: store result in DB, only send to Telegram on error
+        if is_silent_cron {
+            if full_response.is_empty() {
+                full_response = "(No response)".to_string();
+            }
+            if let Some(db) = crate::services::storage::get_db() {
+                let status = if had_error { "error" } else { "success" };
+                let summary_text = truncate_str(&full_response, 500).to_string();
+                if let Ok(run_id) = db.start_cron_run(&schedule_id, &entry_clone.bot_key, exec_session_id.as_deref()) {
+                    let _ = db.finish_cron_run(run_id, status, &summary_text, &full_response);
+                }
+            }
+            if had_error {
+                let error_preview = truncate_str(&full_response, 200);
+                shared_rate_limit_wait(&state_owned, chat_id).await;
+                let _ = tg!("send_message", bot_owned.send_message(chat_id, format!("⚠ [{}] Error: {}", schedule_id, error_preview)).await);
+            }
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            if cancelled {
+                println!("  [{ts}] ■ [Schedule/Silent] Stopped: {}", schedule_id);
+            } else {
+                println!("  [{ts}] ✓ [Schedule/Silent] Done: {}", schedule_id);
+            }
+        } else if cancelled {
             sched_debug(&format!("[execute_schedule] id={}, cancelled — killing child process", schedule_id));
             if let Ok(guard) = cancel_token.child_pid.lock() {
                 if let Some(pid) = *guard {
@@ -9571,13 +9608,14 @@ async fn execute_schedule(
                 }
             }
 
+            if let Some(ph_msg_id) = placeholder_msg_id {
             shared_rate_limit_wait(&state_owned, chat_id).await;
             // ── Show remaining delta + stopped (unified rolling placeholder) ──
             if full_response.len() < last_confirmed_len || !full_response.is_char_boundary(last_confirmed_len) { last_confirmed_len = 0; }
             let remaining = &full_response[last_confirmed_len..];
             if should_attach_response_as_file(full_response.len(), provider_str) {
                 let notice = format!("\u{1f4c4} Response attached as file [Stopped]\n\nUse /{} to continue this schedule session.", schedule_id);
-                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &notice).await);
+                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, ph_msg_id, &notice).await);
                 let stopped_content = format!("{}\n\n[Stopped]", normalize_empty_lines(&full_response));
                 send_response_as_file(&bot_owned, chat_id, &stopped_content, &state_owned, "schedule").await;
             } else {
@@ -9587,8 +9625,9 @@ async fn execute_schedule(
                     let normalized = normalize_empty_lines(remaining);
                     format!("{}\n\n⛔ Stopped\n\nUse /{} to continue this schedule session.", normalized, schedule_id)
                 };
-                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &display_stopped).await);
+                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, ph_msg_id, &display_stopped).await);
             }
+            } // if let Some(ph_msg_id)
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ■ [Schedule] Stopped");
@@ -9598,58 +9637,60 @@ async fn execute_schedule(
                 sched_debug(&format!("[fr_trace][{}] =NoResponse: set to '(No response)'", chat_id.0));
             }
 
+            if let Some(ph_msg_id) = placeholder_msg_id {
             shared_rate_limit_wait(&state_owned, chat_id).await;
 
             // ── Send only remaining delta (unified rolling placeholder) ──
             if full_response.len() < last_confirmed_len || !full_response.is_char_boundary(last_confirmed_len) { last_confirmed_len = 0; }
             let remaining = &full_response[last_confirmed_len..];
-            msg_debug(&format!("[rolling_ph/sched] FINAL: placeholder_msg_id={}, confirmed={}, total={}, remaining_len={}",
-                placeholder_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
+            msg_debug(&format!("[rolling_ph/sched] FINAL: placeholder_msg_id={:?}, confirmed={}, total={}, remaining_len={}",
+                ph_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
             if remaining.trim().is_empty() {
-                msg_debug(&format!("[rolling_ph/sched] FINAL DELETE placeholder: msg_id={}", placeholder_msg_id));
-                let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                msg_debug(&format!("[rolling_ph/sched] FINAL DELETE placeholder: msg_id={:?}", ph_msg_id));
+                let _ = tg!("delete_message", bot_owned.delete_message(chat_id, ph_msg_id).await);
             } else if should_attach_response_as_file(full_response.len(), provider_str) {
                 msg_debug(&format!("[rolling_ph/sched] FINAL FILE ATTACH: total={}", full_response.len()));
                 let notice = format!("\u{1f4c4} Response attached as file\n\nUse /{} to continue this schedule session.", schedule_id);
-                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &notice).await);
+                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, ph_msg_id, &notice).await);
                 let final_text = format!("{}\n\nUse /{} to continue this schedule session.", normalize_empty_lines(&full_response), schedule_id);
                 send_response_as_file(&bot_owned, chat_id, &final_text, &state_owned, "schedule").await;
             } else {
                 let normalized_remaining = normalize_empty_lines(remaining);
                 let final_text = format!("{}\n\nUse /{} to continue this schedule session.", normalized_remaining, schedule_id);
                 let html_response = markdown_to_telegram_html(&final_text);
-                msg_debug(&format!("[rolling_ph/sched] FINAL EDIT placeholder: msg_id={}, html_len={}", placeholder_msg_id, html_response.len()));
+                msg_debug(&format!("[rolling_ph/sched] FINAL EDIT placeholder: msg_id={:?}, html_len={}", ph_msg_id, html_response.len()));
                 if html_response.len() <= TELEGRAM_MSG_LIMIT {
-                    if let Err(_) = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_response)
+                    if let Err(_) = tg!("edit_message", bot_owned.edit_message_text(chat_id, ph_msg_id, &html_response)
                         .parse_mode(ParseMode::Html).await)
                     {
                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &final_text).await);
+                        let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, ph_msg_id, &final_text).await);
                     }
                 } else {
                     let send_result = send_long_message(&bot_owned, chat_id, &html_response, Some(ParseMode::Html), &state_owned).await;
                     match send_result {
                         Ok(_) => {
                             shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                            let _ = tg!("delete_message", bot_owned.delete_message(chat_id, ph_msg_id).await);
                         }
                         Err(_) => {
                             let fallback = send_long_message(&bot_owned, chat_id, &final_text, None, &state_owned).await;
                             match fallback {
                                 Ok(_) => {
                                     shared_rate_limit_wait(&state_owned, chat_id).await;
-                                    let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                                    let _ = tg!("delete_message", bot_owned.delete_message(chat_id, ph_msg_id).await);
                                 }
                                 Err(_) => {
                                     shared_rate_limit_wait(&state_owned, chat_id).await;
                                     let truncated = truncate_str(&final_text, TELEGRAM_MSG_LIMIT);
-                                    let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &truncated).await);
+                                    let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, ph_msg_id, &truncated).await);
                                 }
                             }
                         }
                     }
                 }
             }
+            } // if let Some(ph_msg_id)
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ✓ [Schedule] Done");

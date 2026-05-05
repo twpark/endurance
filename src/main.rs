@@ -304,6 +304,7 @@ fn handle_cron_register(prompt: &str, at_value: &str, chat_id: i64, hash_key: &s
         last_run: None,
         created_at: now.format("%Y-%m-%d %H:%M:%S").to_string(),
         context_summary: None,
+        silent: true,
     }).unwrap_or_else(|e| {
         cron_debug(&format!("  ERROR: write_schedule_entry failed: {}", e));
         eprintln!("{}", serde_json::json!({"status":"error","message":format!("{}", e)}));
@@ -440,6 +441,7 @@ fn handle_cron_context(args: &[String]) {
                 last_run: None,
                 created_at: ctx.created_at.clone(),
                 context_summary: Some(summary),
+                silent: true,
             }).unwrap_or_else(|e| {
                 cron_debug(&format!("  ERROR: write_schedule_entry failed: {}", e));
             });
