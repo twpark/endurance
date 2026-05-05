@@ -47,6 +47,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Endurance additions
 axum = "0.7"
+tokio-stream = "0.1"
 tower-http = { version = "0.6", features = ["cors"] }
 grammers-client = "0.9"
 grammers-session = "0.9"

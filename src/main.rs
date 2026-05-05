@@ -734,6 +734,7 @@ fn handle_ccserver(tokens: Vec<String>) {
             false
         }
     };
+    let _ = services::storage::init_broadcast();
     println!("  ▸ API Server   : http://0.0.0.0:3838");
     println!();
 

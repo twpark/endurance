@@ -2,6 +2,37 @@ use rusqlite::{Connection, params};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
+use tokio::sync::broadcast;
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LiveEvent {
+    pub event_type: String,
+    pub chat_id: String,
+    pub bot_id: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<i64>,
+}
+
+static LIVE_TX: OnceLock<broadcast::Sender<LiveEvent>> = OnceLock::new();
+
+pub fn init_broadcast() -> broadcast::Sender<LiveEvent> {
+    let (tx, _) = broadcast::channel(256);
+    let _ = LIVE_TX.set(tx.clone());
+    tx
+}
+
+pub fn get_broadcast() -> Option<&'static broadcast::Sender<LiveEvent>> {
+    LIVE_TX.get()
+}
+
+pub fn emit_live(event: LiveEvent) {
+    if let Some(tx) = LIVE_TX.get() {
+        let _ = tx.send(event);
+    }
+}
 
 static GLOBAL_DB: OnceLock<EnduranceDb> = OnceLock::new();
 

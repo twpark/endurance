@@ -1,12 +1,15 @@
 use axum::{
     Router, Json,
     extract::{Query, Path, State},
+    response::sse::{Event as SseEvent, Sse, KeepAlive},
     routing::{get, post},
 };
 use tower_http::cors::{CorsLayer, Any};
 use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
 
 use super::storage::{self, EnduranceDb};
 
@@ -31,6 +34,7 @@ pub fn create_router(db: &'static EnduranceDb) -> Router {
         .route("/api/crons/issues/:id/resolve", post(resolve_issue))
         .route("/api/send", post(send_message))
         .route("/api/usage", get(get_usage))
+        .route("/api/stream", get(stream_events))
         .layer(cors)
         .with_state(state)
 }
@@ -168,6 +172,35 @@ async fn get_usage() -> Json<Value> {
         }
         Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
     }
+}
+
+#[derive(Deserialize)]
+struct StreamQuery {
+    chat_id: Option<String>,
+}
+
+async fn stream_events(
+    Query(q): Query<StreamQuery>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
+    let rx = storage::get_broadcast()
+        .expect("broadcast not initialized")
+        .subscribe();
+
+    let chat_filter = q.chat_id.unwrap_or_default();
+
+    let stream = BroadcastStream::new(rx)
+        .filter_map(move |msg| {
+            match msg {
+                Ok(evt) if chat_filter.is_empty() || evt.chat_id == chat_filter => {
+                    let event_type = evt.event_type.clone();
+                    let data = serde_json::to_string(&evt).unwrap_or_default();
+                    Some(Ok(SseEvent::default().event(event_type).data(data)))
+                }
+                _ => None,
+            }
+        });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 pub async fn start_api(port: u16) {

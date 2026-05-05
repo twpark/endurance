@@ -7097,6 +7097,14 @@ async fn handle_text_message(
                                             "assistant", "", None, Some(&sid),
                                         ).ok();
                                     }
+                                    storage::emit_live(storage::LiveEvent {
+                                        event_type: "init".into(),
+                                        chat_id: chat_id.0.to_string(),
+                                        bot_id: bot_username_for_log.clone(),
+                                        content: sid.clone(),
+                                        tool_name: None,
+                                        message_id: db_msg_id,
+                                    });
                                 }
                                 StreamMessage::Thinking { content } => {
                                     // Capture thinking but don't send to Telegram
@@ -7105,11 +7113,27 @@ async fn handle_text_message(
                                         let _ = db.store_reasoning(msg_id, &content, db_thinking_seq);
                                         db_thinking_seq += 1;
                                     }
+                                    storage::emit_live(storage::LiveEvent {
+                                        event_type: "thinking".into(),
+                                        chat_id: chat_id.0.to_string(),
+                                        bot_id: bot_username_for_log.clone(),
+                                        content: content.clone(),
+                                        tool_name: None,
+                                        message_id: db_msg_id,
+                                    });
                                 }
                                 StreamMessage::Text { content } => {
                                     msg_debug(&format!("[polling] Text: {} chars, preview={:?}",
                                         content.len(), truncate_str(&content, 80)));
                                     ai_trace(&format!("[STREAM] Text: {} chars, total_so_far={}", content.len(), full_response.len() + content.len()));
+                                    storage::emit_live(storage::LiveEvent {
+                                        event_type: "text".into(),
+                                        chat_id: chat_id.0.to_string(),
+                                        bot_id: bot_username_for_log.clone(),
+                                        content: content.clone(),
+                                        tool_name: None,
+                                        message_id: db_msg_id,
+                                    });
                                     raw_entries.push(RawPayloadEntry { tag: "Text".into(), content: content.clone() });
                                     let _fr_before = full_response.len();
                                     full_response.push_str(&content);
@@ -7125,6 +7149,14 @@ async fn handle_text_message(
                                         db_tool_id = db.store_tool_call(msg_id, &name, &input, db_tool_seq).ok();
                                         db_tool_seq += 1;
                                     }
+                                    storage::emit_live(storage::LiveEvent {
+                                        event_type: "tool_use".into(),
+                                        chat_id: chat_id.0.to_string(),
+                                        bot_id: bot_username_for_log.clone(),
+                                        content: input.clone(),
+                                        tool_name: Some(name.clone()),
+                                        message_id: db_msg_id,
+                                    });
                                     let summary = format_tool_input(&name, &input);
                                     let ts = chrono::Local::now().format("%H:%M:%S");
                                     println!("  [{ts}]   ⚙ {name}: {summary}");
@@ -7161,6 +7193,14 @@ async fn handle_text_message(
                                         let _ = db.update_tool_result(tool_id, &content, None);
                                         db_tool_id = None;
                                     }
+                                    storage::emit_live(storage::LiveEvent {
+                                        event_type: "tool_result".into(),
+                                        chat_id: chat_id.0.to_string(),
+                                        bot_id: bot_username_for_log.clone(),
+                                        content: content.clone(),
+                                        tool_name: Some(last_tool_name.clone()),
+                                        message_id: db_msg_id,
+                                    });
                                     raw_entries.push(RawPayloadEntry { tag: "ToolResult".into(), content: format!("is_error={}, content={}", is_error, content) });
                                     let _fr_before = full_response.len();
                                     if std::mem::take(&mut pending_cokacdir) {
@@ -7224,6 +7264,14 @@ async fn handle_text_message(
                                     msg_debug(&format!("[polling] Done: result_len={}, session_id={:?}, full_response_len={}",
                                         result.len(), sid, full_response.len()));
                                     ai_trace(&format!("[STREAM] Done: result_len={}, full_response_len={}, session_id={:?}", result.len(), full_response.len(), sid));
+                                    storage::emit_live(storage::LiveEvent {
+                                        event_type: "done".into(),
+                                        chat_id: chat_id.0.to_string(),
+                                        bot_id: bot_username_for_log.clone(),
+                                        content: String::new(),
+                                        tool_name: None,
+                                        message_id: db_msg_id,
+                                    });
                                     if !result.is_empty() && full_response.is_empty() {
                                         msg_debug(&format!("[polling] Done: fallback full_response = result ({})", result.len()));
                                         full_response = result.clone();
