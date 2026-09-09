@@ -450,6 +450,8 @@ struct BotSettings {
     use_chrome: HashMap<String, bool>,
     /// chat_id (string) → message to send when AI processing completes
     end_hook: HashMap<String, String>,
+    /// chat_id (string) → AI backend: "tmux" for interactive tmux session, default is "pipe" (-p mode)
+    backend: HashMap<String, String>,
 }
 
 impl Default for BotSettings {
@@ -471,8 +473,16 @@ impl Default for BotSettings {
             greeting: false,
             use_chrome: HashMap::new(),
             end_hook: HashMap::new(),
+            backend: HashMap::new(),
         }
     }
+}
+
+/// Check if this chat uses tmux interactive backend
+fn is_tmux_backend(settings: &BotSettings, chat_id: ChatId) -> bool {
+    settings.backend.get(&chat_id.0.to_string())
+        .map(|b| b == "tmux")
+        .unwrap_or(false)
 }
 
 /// Get allowed tools for a specific chat_id.
@@ -1991,7 +2001,14 @@ fn load_bot_settings(token: &str) -> BotSettings {
             .collect())
         .unwrap_or_default();
 
-    BotSettings { allowed_tools, last_sessions, owner_user_id, as_public_for_group_chat, models, debug, silent, direct, context, instructions, queue, username, display_name, greeting, use_chrome, end_hook }
+    let backend: HashMap<String, String> = entry.get("backend")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect())
+        .unwrap_or_default();
+
+    BotSettings { allowed_tools, last_sessions, owner_user_id, as_public_for_group_chat, models, debug, silent, direct, context, instructions, queue, username, display_name, greeting, use_chrome, end_hook, backend }
 }
 
 /// Save bot settings to bot_settings.json
@@ -2035,6 +2052,7 @@ fn save_bot_settings(token: &str, settings: &BotSettings) {
         "greeting": settings.greeting,
         "use_chrome": settings.use_chrome,
         "end_hook": settings.end_hook,
+        "backend": settings.backend,
     });
     if let Some(owner_id) = settings.owner_user_id {
         entry["owner_user_id"] = serde_json::json!(owner_id);
@@ -2352,6 +2370,15 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
     let scheduler_bot_display_name = bot_display_name.clone();
     let scheduler_handle = tokio::spawn(scheduler_loop(scheduler_bot, scheduler_state, scheduler_token, scheduler_bot_username, scheduler_bot_display_name));
 
+    // Spawn tmux idle session cleanup (every 60s, kill sessions idle > 5min)
+    let tmux_cleanup_handle = tokio::spawn(async {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            crate::services::tmux::cleanup_idle(std::time::Duration::from_secs(300));
+        }
+    });
+
     // Flush all pending updates so we don't process messages that arrived while
     // the bot was offline.
     // Step 1: getUpdates(offset=-1) discards all but the last pending update.
@@ -2454,6 +2481,7 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
     }
 
     scheduler_handle.abort();
+    tmux_cleanup_handle.abort();
 }
 
 /// Route incoming messages to appropriate handlers
@@ -2608,13 +2636,14 @@ async fn handle_message(
                 if !text.is_empty() {
                     // Block if an AI request is already in progress
                     // Atomically: check busy + queue mode + push to queue (prevents race with /stopall)
-                    let (ai_busy, queue_enabled, queue_result) = {
+                    let (ai_busy, queue_enabled, queue_result, tmux_active) = {
                         let mut data = state.lock().await;
                         let busy = data.cancel_tokens.contains_key(&chat_id);
+                        let is_tmux = is_tmux_backend(&data.settings, chat_id);
                         let qkey = chat_id.0.to_string();
                         let qmode = data.settings.queue.get(&qkey).copied().unwrap_or(QUEUE_MODE_DEFAULT);
-                        msg_debug(&format!("[queue:media] chat_id={}, busy={}, queue_mode={}", chat_id.0, busy, qmode));
-                        let qr = if busy && qmode {
+                        msg_debug(&format!("[queue:media] chat_id={}, busy={}, queue_mode={}, tmux={}", chat_id.0, busy, qmode, is_tmux));
+                        let qr = if busy && qmode && !is_tmux {
                             let cur_len = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
                             let queue_full = cur_len >= MAX_QUEUE_SIZE;
                             if queue_full {
@@ -2639,10 +2668,16 @@ async fn handle_message(
                         } else {
                             None
                         };
-                        (busy, qmode, qr)
+                        (busy, qmode, qr, is_tmux)
                     };
                     if ai_busy {
-                        if queue_enabled {
+                        if tmux_active {
+                            let tmux_name = crate::services::tmux::session_name(token, chat_id.0);
+                            msg_debug(&format!("[tmux:btw:media] sending /btw to {}", tmux_name));
+                            if let Err(e) = crate::services::tmux::send_btw(&tmux_name, text) {
+                                msg_debug(&format!("[tmux:btw:media] error: {}", e));
+                            }
+                        } else if queue_enabled {
                             shared_rate_limit_wait(&state, chat_id).await;
                             if let Some((qid, qtxt)) = queue_result {
                                 let preview = truncate_str(&qtxt, 30);
@@ -2879,16 +2914,16 @@ async fn handle_message(
         };
         msg_debug(&format!("[queue:text] chat_id={}, text={:?}, queue_text={:?}", chat_id.0, truncate_str(&text, 60), queue_text.map(|s| truncate_str(s, 60))));
 
-        // Atomically: check busy + queue mode + push to queue (prevents race with /stopall)
-        // Returns: Option<(can_queue, queue_on, queue_result)>
-        //   queue_result: Some((id, text)) if queued, None if full/non-queueable
-        let busy_info: Option<(bool, bool, Option<(String, String)>)> = {
+        // Atomically: check busy + queue mode + tmux + push to queue (prevents race with /stopall)
+        // Returns: Option<(can_queue, queue_on, queue_result, is_tmux)>
+        let busy_info: Option<(bool, bool, Option<(String, String)>, bool)> = {
             let mut data = state.lock().await;
             if data.cancel_tokens.contains_key(&chat_id) {
+                let is_tmux = is_tmux_backend(&data.settings, chat_id);
                 let qkey = chat_id.0.to_string();
                 let queue_enabled = data.settings.queue.get(&qkey).copied().unwrap_or(QUEUE_MODE_DEFAULT);
-                msg_debug(&format!("[queue:text] chat_id={}, AI busy, queue_mode={}, queueable={}", chat_id.0, queue_enabled, queue_text.is_some()));
-                let qr = if queue_enabled {
+                msg_debug(&format!("[queue:text] chat_id={}, AI busy, queue_mode={}, queueable={}, tmux={}", chat_id.0, queue_enabled, queue_text.is_some(), is_tmux));
+                let qr = if queue_enabled && !is_tmux {
                     if let Some(qt) = queue_text {
                         let cur_len = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
                         let queue_full = cur_len >= MAX_QUEUE_SIZE;
@@ -2918,15 +2953,21 @@ async fn handle_message(
                 } else {
                     None
                 };
-                Some((queue_enabled && queue_text.is_some(), queue_enabled, qr))
+                Some((queue_enabled && queue_text.is_some(), queue_enabled, qr, is_tmux))
             } else {
                 msg_debug(&format!("[queue:text] chat_id={}, AI not busy, proceeding normally", chat_id.0));
                 None // not busy
             }
         };
 
-        if let Some((can_queue, queue_on, queue_result)) = busy_info {
-            if can_queue {
+        if let Some((can_queue, queue_on, queue_result, tmux_active)) = busy_info {
+            if tmux_active {
+                let tmux_name = crate::services::tmux::session_name(token, chat_id.0);
+                msg_debug(&format!("[tmux:btw:text] sending /btw to {}", tmux_name));
+                if let Err(e) = crate::services::tmux::send_btw(&tmux_name, &text) {
+                    msg_debug(&format!("[tmux:btw:text] error: {}", e));
+                }
+            } else if can_queue {
                 shared_rate_limit_wait(&state, chat_id).await;
                 if let Some((qid, _qtxt)) = queue_result {
                     // Compact queue feedback — minimal interruption
@@ -6787,7 +6828,7 @@ async fn handle_text_message(
     }
 
     // Get session info, allowed tools, model, pending uploads, history, instruction, and bot_username (drop lock before any await)
-    let (session_info, allowed_tools, pending_uploads, model, history, instruction, context_count, bot_username_for_prompt, bot_display_name_for_prompt, chrome_enabled) = {
+    let (session_info, allowed_tools, pending_uploads, model, history, instruction, context_count, bot_username_for_prompt, bot_display_name_for_prompt, chrome_enabled, tmux_enabled) = {
         let mut data = state.lock().await;
         let info = data.sessions.get(&chat_id).and_then(|session| {
             session.current_path.as_ref().map(|_| {
@@ -6808,9 +6849,10 @@ async fn handle_text_message(
         let buname = data.bot_username.clone();
         let bdname = data.bot_display_name.clone();
         let chrome = data.settings.use_chrome.get(&chat_id.0.to_string()).copied().unwrap_or(false);
-        msg_debug(&format!("[handle_text_message] session_id={:?}, current_path={:?}, model={:?}, uploads={}, history_len={}, instruction={:?}",
-            info.as_ref().map(|(sid, _)| sid), info.as_ref().map(|(_, p)| p), mdl, uploads.len(), hist.len(), instr.is_some()));
-        (info, tools, uploads, mdl, hist, instr, ctx_count, buname, bdname, chrome)
+        let use_tmux = is_tmux_backend(&data.settings, chat_id);
+        msg_debug(&format!("[handle_text_message] session_id={:?}, current_path={:?}, model={:?}, uploads={}, history_len={}, instruction={:?}, tmux={}",
+            info.as_ref().map(|(sid, _)| sid), info.as_ref().map(|(_, p)| p), mdl, uploads.len(), hist.len(), instr.is_some(), use_tmux));
+        (info, tools, uploads, mdl, hist, instr, ctx_count, buname, bdname, chrome, use_tmux)
     };
 
     let (session_id, current_path) = match session_info {
@@ -6901,6 +6943,8 @@ async fn handle_text_message(
     let session_id_clone = session_id.clone();
     let current_path_clone = current_path.clone();
     let cancel_token_clone = cancel_token.clone();
+    let tmux_bot_key = bot_key_for_prompt.clone();
+    let tmux_chat_id = chat_id.0;
 
     // Run AI backend in a blocking thread
     let model_clone = model.clone();
@@ -6993,7 +7037,12 @@ async fn handle_text_message(
             )
         } else {
             let claude_model = model_clone.as_deref().and_then(claude::strip_claude_prefix);
-            msg_debug(&format!("[handle_text_message] → claude::execute, claude_model={:?}", claude_model));
+            let tmux_name = if tmux_enabled {
+                Some(crate::services::tmux::session_name(&tmux_bot_key, tmux_chat_id))
+            } else {
+                None
+            };
+            msg_debug(&format!("[handle_text_message] → claude::execute, claude_model={:?}, tmux={:?}", claude_model, tmux_name));
             claude::execute_command_streaming(
                 &context_prompt,
                 session_id_clone.as_deref(),
@@ -7005,6 +7054,7 @@ async fn handle_text_message(
                 claude_model,
                 false,
                 chrome_enabled,
+                tmux_name.as_deref(),
             )
         };
 
@@ -7714,13 +7764,51 @@ async fn handle_text_message(
                                     }
                                 }).await.ok();
                             }
-                            let verify_result = tokio::task::spawn_blocking(move || {
-                                match provider_for_verify {
-                                    "codex" => crate::services::codex::verify_completion_codex(&sid_clone, &cwd_clone),
-                                    "opencode" => crate::services::opencode::verify_completion_opencode(&sid_clone, &cwd_clone),
-                                    _ => crate::services::claude::verify_completion(&sid_clone, &cwd_clone),
+                            // Check if tmux mode is active for this chat
+                            let verify_tmux_name = {
+                                let data = state_owned.lock().await;
+                                if is_tmux_backend(&data.settings, chat_id) {
+                                    let bk = token_hash(bot_owned.token());
+                                    Some(crate::services::tmux::session_name(&bk, chat_id.0))
+                                } else {
+                                    None
                                 }
-                            }).await;
+                            };
+                            let verify_result = if let Some(ref tmux_name) = verify_tmux_name {
+                                // tmux mode: use /btw to verify in-session
+                                let tn = tmux_name.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let verify_prompt = "Review what you just did. If the task is fully complete, respond with ONLY: mission_complete. Otherwise respond with: mission_pending followed by one short follow-up instruction.";
+                                    if let Err(e) = crate::services::tmux::send_btw(&tn, verify_prompt) {
+                                        return Err(e);
+                                    }
+                                    // Wait for /btw response, then capture pane
+                                    std::thread::sleep(std::time::Duration::from_secs(5));
+                                    let pane_text = crate::services::tmux::capture_pane_text(&tn).unwrap_or_default();
+                                    // Check last ~20 lines for verify keywords
+                                    let tail: String = pane_text.lines().rev().take(20)
+                                        .collect::<Vec<_>>().into_iter().rev()
+                                        .collect::<Vec<_>>().join("\n");
+                                    let pending = tail.contains("mission_pending");
+                                    let complete = tail.contains("mission_complete") && !pending;
+                                    let feedback = if complete {
+                                        None
+                                    } else {
+                                        let f = tail.replace("mission_pending", "").replace("mission_complete", "");
+                                        let f = f.trim();
+                                        if f.is_empty() { None } else { Some(f.to_string()) }
+                                    };
+                                    Ok(crate::services::claude::VerifyResult { complete, feedback })
+                                }).await
+                            } else {
+                                tokio::task::spawn_blocking(move || {
+                                    match provider_for_verify {
+                                        "codex" => crate::services::codex::verify_completion_codex(&sid_clone, &cwd_clone),
+                                        "opencode" => crate::services::opencode::verify_completion_opencode(&sid_clone, &cwd_clone),
+                                        _ => crate::services::claude::verify_completion(&sid_clone, &cwd_clone),
+                                    }
+                                }).await
+                            };
                             // Stop animation and await its task so no stray
                             // edit lands after the delete below.
                             verify_anim_stop.store(true, Ordering::Relaxed);
@@ -9390,6 +9478,7 @@ async fn execute_schedule(
                 claude_model,
                 false,
                 sched_chrome_enabled,
+                None, // TODO: wire tmux for scheduled tasks
             )
         };
         if let Err(e) = result {
@@ -10207,6 +10296,7 @@ async fn process_bot_message(
                 claude_model,
                 false,
                 botmsg_chrome_enabled,
+                None, // TODO: wire tmux for bot messages
             )
         };
         if let Err(e) = result {

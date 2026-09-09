@@ -12,5 +12,6 @@ pub mod dedup;
 pub mod session_archive;
 pub mod telegram;
 pub mod storage;
+pub mod tmux;
 pub mod api;
 pub mod user_api;

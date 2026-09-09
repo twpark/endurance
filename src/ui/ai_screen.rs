@@ -911,6 +911,7 @@ Keep responses concise and terminal-friendly.",
                 None,
                 false,
                 false,
+                None, // TUI always uses pipe mode
             );
 
             let elapsed = start_time.elapsed();

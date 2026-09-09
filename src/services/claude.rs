@@ -978,7 +978,58 @@ pub fn execute_command_streaming(
     model: Option<&str>,
     no_session_persistence: bool,
     use_chrome: bool,
+    tmux_session: Option<&str>,
 ) -> Result<(), String> {
+    // --- tmux interactive mode ---
+    if let Some(tmux_name) = tmux_session {
+        debug_log("=== execute_command_streaming [TMUX MODE] ===");
+        debug_log(&format!("tmux_session={}, prompt_len={}", tmux_name, prompt.len()));
+
+        let claude_bin = get_claude_path()
+            .ok_or_else(|| "Claude CLI not found".to_string())?;
+
+        // Write system prompt file (same as pipe mode)
+        let default_sp = "";
+        let effective_sp = match system_prompt {
+            None => None,
+            Some("") => None,
+            Some(p) => Some(p),
+        };
+        let mut sp_path_buf: Option<std::path::PathBuf> = None;
+        if let Some(sp) = effective_sp {
+            let sp_dir = dirs::home_dir().unwrap_or_else(std::env::temp_dir).join(".cokacdir");
+            let _ = std::fs::create_dir_all(&sp_dir);
+            let path = sp_dir.join(format!("system_prompt_{}", simple_uuid()));
+            let _ = std::fs::write(&path, sp);
+            sp_path_buf = Some(path);
+        }
+        let _ = default_sp;
+
+        crate::services::tmux::create_session(
+            tmux_name,
+            working_dir,
+            &claude_bin,
+            session_id,
+            sp_path_buf.as_ref().map(|p| p.to_str().unwrap_or("")),
+        )?;
+
+        let result = crate::services::tmux::send_and_stream(
+            tmux_name,
+            prompt,
+            sender,
+            cancel_token,
+            session_id,
+        );
+
+        // Clean up system prompt file
+        if let Some(path) = sp_path_buf {
+            let _ = std::fs::remove_file(path);
+        }
+
+        return result;
+    }
+
+    // --- existing pipe (-p) mode ---
     debug_log("========================================");
     debug_log("=== execute_command_streaming START ===");
     debug_log("========================================");

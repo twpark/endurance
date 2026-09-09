@@ -180,6 +180,7 @@ struct StreamQuery {
 }
 
 async fn stream_events(
+    State(_state): State<Arc<ApiState>>,
     Query(q): Query<StreamQuery>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
     let rx = storage::get_broadcast()
